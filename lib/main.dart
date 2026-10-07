@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:collection';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -67,6 +68,111 @@ class WebViewApp extends StatefulWidget {
 class _WebViewAppState extends State<WebViewApp> {
   InAppWebViewController? webViewController;
 
+  static const platform = MethodChannel('com.muhammadfazal.dua_after_salah/volume_buttons');
+
+  Timer? _loadTimeoutTimer;
+  bool _isOfflineFallbackDone = false;
+
+  final String _onlineUrl = "https://das.muhammadfazal.com";
+
+  @override
+  void initState() {
+    super.initState();
+
+    // Listen for volume button events from native MethodChannel
+    platform.setMethodCallHandler((call) async {
+      if (call.method == "onVolumeUp") {
+        _incrementTasbih();
+      } else if (call.method == "onVolumeDown") {
+        _decrementTasbih();
+      }
+    });
+
+    // Register Flutter hardware keyboard handler as fallback
+    ServicesBinding.instance.keyboard.addHandler(_onKeyEvent);
+  }
+
+  @override
+  void dispose() {
+    ServicesBinding.instance.keyboard.removeHandler(_onKeyEvent);
+    _cancelTimeoutTimer();
+    super.dispose();
+  }
+
+  bool _onKeyEvent(KeyEvent event) {
+    if (event is KeyDownEvent) {
+      if (event.logicalKey == LogicalKeyboardKey.audioVolumeUp) {
+        _incrementTasbih();
+        return true;
+      } else if (event.logicalKey == LogicalKeyboardKey.audioVolumeDown) {
+        _decrementTasbih();
+        return true;
+      }
+    }
+    return false;
+  }
+
+  void _incrementTasbih() {
+    webViewController?.evaluateJavascript(
+      source: """
+        if (typeof incrementTasbih === 'function') {
+          incrementTasbih();
+        } else if (typeof window.incrementTasbih === 'function') {
+          window.incrementTasbih();
+        }
+      """,
+    );
+  }
+
+  void _decrementTasbih() {
+    webViewController?.evaluateJavascript(
+      source: """
+        if (typeof decrementTasbih === 'function') {
+          decrementTasbih();
+        } else if (typeof window.decrementTasbih === 'function') {
+          window.decrementTasbih();
+        }
+      """,
+    );
+  }
+
+  void _startLoadTimeoutTimer() {
+    _cancelTimeoutTimer();
+    _loadTimeoutTimer = Timer(const Duration(milliseconds: 3500), () {
+      _fallbackToOffline();
+    });
+  }
+
+  void _cancelTimeoutTimer() {
+    _loadTimeoutTimer?.cancel();
+    _loadTimeoutTimer = null;
+  }
+
+  void _fallbackToOffline() async {
+    _cancelTimeoutTimer();
+    if (_isOfflineFallbackDone) return;
+    _isOfflineFallbackDone = true;
+
+    if (webViewController != null) {
+      try {
+        await webViewController!.stopLoading();
+      } catch (_) {}
+
+      // Fallback directly to cached offline content inside the WebView
+      await webViewController!.setSettings(
+        settings: InAppWebViewSettings(
+          cacheMode: CacheMode.LOAD_CACHE_ONLY,
+        ),
+      );
+
+      await webViewController!.loadUrl(
+        urlRequest: URLRequest(
+          url: WebUri(_onlineUrl),
+        ),
+      );
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -76,7 +182,7 @@ class _WebViewAppState extends State<WebViewApp> {
         // bottom: true (ডিফল্ট) থাকায় নেভিগেশন বারের উপরে থাকবে
         child: InAppWebView(
           initialUrlRequest: URLRequest(
-            url: WebUri("https://das.muhammadfazal.com"),
+            url: WebUri(_onlineUrl),
           ),
           initialUserScripts: UnmodifiableListView<UserScript>([
             // স্ক্রলবার হাইড করার পাশাপাশি জুম বন্ধ করার জন্য মেটা ট্যাগ ইনজেকশন
@@ -109,9 +215,36 @@ class _WebViewAppState extends State<WebViewApp> {
 
             useHybridComposition: true,
             allowsInlineMediaPlayback: true,
+
+            // অফলাইন ও ক্যাশ সেটিংস
+            cacheEnabled: true,
+            domStorageEnabled: true,
+            databaseEnabled: true,
+            cacheMode: CacheMode.LOAD_DEFAULT,
           ),
           onWebViewCreated: (controller) {
             webViewController = controller;
+            _startLoadTimeoutTimer();
+          },
+          onLoadStart: (controller, url) {
+            if (!_isOfflineFallbackDone) {
+              _startLoadTimeoutTimer();
+            }
+          },
+          onLoadStop: (controller, url) {
+            _cancelTimeoutTimer();
+          },
+          onReceivedError: (controller, request, error) {
+            if (request.isForMainFrame ?? true) {
+              _fallbackToOffline();
+            }
+          },
+          onReceivedHttpError: (controller, request, errorResponse) {
+            if (request.isForMainFrame ?? true) {
+              if ((errorResponse.statusCode ?? 0) >= 400) {
+                _fallbackToOffline();
+              }
+            }
           },
           shouldOverrideUrlLoading: (controller, navigationAction) async {
             var uri = navigationAction.request.url!;
